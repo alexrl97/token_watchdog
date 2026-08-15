@@ -1,0 +1,35 @@
+# Diese Datei im neuen Repo nach .github/workflows/watchdog.yml verschieben!
+#
+# Stop-Loss-Wächter, alle 10 Minuten. In einem ÖFFENTLICHEN Repo sind
+# Actions-Minuten unbegrenzt kostenlos. GitHub-Cron hat Jitter (0-15 min) —
+# für Pünktlichkeit zusätzlich per externem Cron workflow_dispatch triggern:
+#   curl -X POST -H "Authorization: Bearer <PAT>" \
+#     -H "Accept: application/vnd.github+json" \
+#     https://api.github.com/repos/<user>/<repo>/actions/workflows/watchdog.yml/dispatches \
+#     -d '{"ref":"main"}'
+name: watchdog
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: watchdog
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+      - run: npm install --no-audit --no-fund
+      - name: Wächter ausführen
+        env:
+          FAMILY_WALLET_PRIVATE_KEY: ${{ secrets.FAMILY_WALLET_PRIVATE_KEY }}
+          RPC_URL: ${{ secrets.RPC_URL }}
+        run: node watchdog.js
