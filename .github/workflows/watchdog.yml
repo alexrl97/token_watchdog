@@ -23,7 +23,7 @@ concurrency:
 jobs:
   watch:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -35,20 +35,34 @@ jobs:
         env:
           FAMILY_WALLET_PRIVATE_KEY: ${{ secrets.FAMILY_WALLET_PRIVATE_KEY }}
           RPC_URL: ${{ secrets.RPC_URL }}
-          # Interner Poll-Loop: ~4:50 min lang alle 70 s prüfen (≈5 Checks/Job).
-          # Ein externer Trigger alle 5 min ergibt so lückenloses ~70-s-Polling.
-          WATCHDOG_LOOP_SECONDS: "290"
-          WATCHDOG_INTERVAL_SECONDS: "70"
+          # Interner Poll-Loop: ~25 min lang alle 20 s Preis prüfen. Der schwere
+          # RPC-Call (gehaltene Positionen) läuft nur alle 5 min → schneller
+          # Preis-Check bleibt rate-limit-fest. Extern alle ~20 min triggern:
+          # dank concurrency übernimmt der nächste Job nahtlos, Startup nur ~1x/25min.
+          WATCHDOG_LOOP_SECONDS: "1500"
+          WATCHDOG_INTERVAL_SECONDS: "20"
+          WATCHDOG_RPC_REFRESH_SECONDS: "300"
         run: node watchdog.js
 
       - name: Trailing-State committen
         if: always()
+        continue-on-error: true # ein fehlgeschlagener Push darf den Job NIE failen
         run: |
           git config user.name "watchdog"
           git config user.email "actions@github.com"
           git add positions.json
-          if ! git diff --cached --quiet; then
-            git commit -m "watchdog: trailing state"
-            git pull --rebase --autostash origin main
-            git push
+          if git diff --cached --quiet; then
+            echo "keine Änderung an positions.json"
+            exit 0
           fi
+          git commit -m "watchdog: trailing state"
+          for attempt in 1 2 3; do
+            if git pull --rebase --autostash origin main && git push; then
+              echo "push ok (Versuch $attempt)"
+              exit 0
+            fi
+            echo "push-Versuch $attempt fehlgeschlagen, retry in 3s ..."
+            sleep 3
+          done
+          echo "push nach 3 Versuchen fehlgeschlagen — ignoriert (nächster Lauf committet neu)"
+          exit 0

@@ -83,10 +83,8 @@ async function sellAll(keypair, mint, rawAmount) {
   return result.signature;
 }
 
-async function runOnce(keypair, connection, checkOnly) {
-  const positions = loadPositions();
-  let stateChanged = false;
-
+// Gehaltene Positionen per RPC ermitteln (schwerer Call — nur selten aufrufen).
+async function fetchHeld(connection, keypair) {
   const held = [];
   for (const programId of [TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID]) {
     const res = await connection.getParsedTokenAccountsByOwner(keypair.publicKey, { programId });
@@ -101,6 +99,14 @@ async function runOnce(keypair, connection, checkOnly) {
       }
     }
   }
+  return held;
+}
+
+// Preis-Check + ggf. Verkauf für die aktuell bekannten Positionen (leichter Teil,
+// nur Jupiter). Mutiert positions UND held (Verkauftes wird entfernt). Gibt zurück,
+// ob sich der Trailing-State geändert hat. `quiet` unterdrückt Halte-Zeilen.
+async function checkHeld(keypair, held, positions, checkOnly, quiet) {
+  let stateChanged = false;
 
   // State von nicht mehr gehaltenen Positionen aufräumen
   const heldMints = new Set(held.map((h) => h.mint));
@@ -112,12 +118,13 @@ async function runOnce(keypair, connection, checkOnly) {
   }
 
   if (held.length === 0) {
-    console.log(`${new Date().toISOString()} Wächter: keine Positionen.`);
-    if (stateChanged) savePositions(positions);
-    return;
+    if (!quiet) console.log(`${new Date().toISOString()} Wächter: keine Positionen.`);
+    return stateChanged;
   }
 
-  for (const acc of held) {
+  // rückwärts iterieren, damit splice bei Verkauf sicher ist
+  for (let hi = held.length - 1; hi >= 0; hi--) {
+    const acc = held[hi];
     let h1 = null,
       m5 = null,
       priceUsd = 0,
@@ -132,13 +139,13 @@ async function runOnce(keypair, connection, checkOnly) {
         m5 = t.stats5m && typeof t.stats5m.priceChange === "number" ? t.stats5m.priceChange : null;
       }
     } catch (err) {
-      console.log(`${acc.mint}: Datenabruf fehlgeschlagen (${err.message}) — übersprungen`);
+      if (!quiet) console.log(`${acc.mint}: Datenabruf fehlgeschlagen (${err.message}) — übersprungen`);
       continue;
     }
 
     const valueUsd = (acc.uiAmount || 0) * priceUsd;
     if (valueUsd < MIN_VALUE_USD) {
-      console.log(`${new Date().toISOString()} ${name} | ~$${valueUsd.toFixed(2)} — Staub, ignoriert`);
+      if (!quiet) console.log(`${new Date().toISOString()} ${name} | ~$${valueUsd.toFixed(2)} — Staub, ignoriert`);
       continue;
     }
 
@@ -167,9 +174,10 @@ async function runOnce(keypair, connection, checkOnly) {
       reason = `TRAILING-STOP (${ddFromHigh.toFixed(1)}% vom Hoch)`;
 
     if (!reason) {
-      console.log(`${new Date().toISOString()} ${name} | ${tag} — hält`);
+      if (!quiet) console.log(`${new Date().toISOString()} ${name} | ${tag} — hält`);
       continue;
     }
+    // Verkaufsgrund wird IMMER geloggt (auch im quiet-Modus)
     console.log(
       `${new Date().toISOString()} ${name} | ${tag} — ${reason}${checkOnly ? " (nur Check)" : ", verkaufe"}`
     );
@@ -178,6 +186,7 @@ async function runOnce(keypair, connection, checkOnly) {
       const sig = await sellAll(keypair, acc.mint, acc.rawAmount);
       console.log(`  -> verkauft (${sig})`);
       delete positions[acc.mint];
+      held.splice(hi, 1); // nicht erneut prüfen/verkaufen
       stateChanged = true;
     } catch (err) {
       console.log(`  -> Verkauf fehlgeschlagen: ${err.message}`);
@@ -185,41 +194,62 @@ async function runOnce(keypair, connection, checkOnly) {
     await new Promise((r) => setTimeout(r, 500));
   }
 
-  if (stateChanged) savePositions(positions);
+  return stateChanged;
 }
 
-// Interner Poll-Loop: ein externer Trigger (alle 5 min) startet EINEN Job, der
-// dann über WATCHDOG_LOOP_SECONDS hinweg alle WATCHDOG_INTERVAL_SECONDS prüft.
-// So gibt es echtes ~1-Min-Polling ohne pro Minute einen GitHub-Run zu starten.
-// Ohne die Env-Variablen (loop<=0) läuft der Wächter wie bisher genau einmal.
+// Ein externer Trigger startet EINEN Job, der über WATCHDOG_LOOP_SECONDS hinweg
+// alle WATCHDOG_INTERVAL_SECONDS den Preis prüft. Der SCHWERE RPC-Call (gehaltene
+// Positionen) läuft nur alle WATCHDOG_RPC_REFRESH_SECONDS — so bleibt der schnelle
+// Preis-Check (nur Jupiter) rate-limit-fest. Ohne WATCHDOG_LOOP_SECONDS läuft der
+// Wächter wie bisher genau einmal.
 async function main() {
   const checkOnly = process.argv.includes("--check");
   const keypair = loadKeypair();
   const connection = new Connection(RPC_URL, "confirmed");
   const loopSec = Number(process.env.WATCHDOG_LOOP_SECONDS || 0);
-  const intervalSec = Number(process.env.WATCHDOG_INTERVAL_SECONDS || 70);
+  const intervalSec = Number(process.env.WATCHDOG_INTERVAL_SECONDS || 20);
+  const rpcRefreshMs = Number(process.env.WATCHDOG_RPC_REFRESH_SECONDS || 300) * 1000;
+  const positions = loadPositions();
 
   if (!(loopSec > 0)) {
-    await runOnce(keypair, connection, checkOnly);
+    const held = await fetchHeld(connection, keypair);
+    if (await checkHeld(keypair, held, positions, checkOnly, false)) savePositions(positions);
     return;
   }
 
   const startMs = Date.now();
+  let held = [];
+  let lastRpc = 0;
   let i = 0;
   while (Date.now() - startMs < loopSec * 1000) {
     i++;
-    const tSec = Math.round((Date.now() - startMs) / 1000);
-    console.log(`--- Iteration ${i} (t+${tSec}s / ${loopSec}s, Intervall ${intervalSec}s) ---`);
-    try {
-      await runOnce(keypair, connection, checkOnly);
-    } catch (err) {
-      console.error("Iteration-Fehler:", err.message);
+    // Positionsliste nur selten via RPC auffrischen (schwerer Call)
+    let refreshed = false;
+    if (Date.now() - lastRpc >= rpcRefreshMs) {
+      try {
+        held = await fetchHeld(connection, keypair);
+        lastRpc = Date.now();
+        refreshed = true;
+      } catch (err) {
+        console.error(`RPC-Refresh fehlgeschlagen (${err.message}) — nutze letzten Stand`);
+      }
     }
-    // vor Ablauf des Fensters nicht noch einen vollen Intervall-Schlaf starten
+    if (refreshed) {
+      const tSec = Math.round((Date.now() - startMs) / 1000);
+      console.log(`--- Check ${i} (t+${tSec}s / ${loopSec}s, alle ${intervalSec}s, ${held.length} Position(en)) ---`);
+    }
+    try {
+      // Halte-Zeilen nur bei RPC-Refresh loggen (sonst würden 20s-Ticks das Log fluten);
+      // Verkäufe werden immer geloggt.
+      if (await checkHeld(keypair, held, positions, checkOnly, !refreshed)) savePositions(positions);
+    } catch (err) {
+      console.error("Check-Fehler:", err.message);
+    }
     if (Date.now() - startMs + intervalSec * 1000 >= loopSec * 1000) break;
     await new Promise((r) => setTimeout(r, intervalSec * 1000));
   }
-  console.log(`Loop beendet nach ${i} Iteration(en).`);
+  savePositions(positions);
+  console.log(`Loop beendet nach ${i} Check(s).`);
 }
 
 main().catch((err) => {
