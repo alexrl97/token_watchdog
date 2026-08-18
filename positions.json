@@ -1,12 +1,8 @@
 {
-  "XRb16PHU7jMDbswDBi18h64nw6gFaSmVmpoenuvpump": {
-    "name": "National Trump Digital Accounts (NTDA)",
-    "firstSeen": "2026-08-18T14:51:14.527Z",
-    "high": 0.1552334455494205
-  },
   "H4XtBNKLZRQxcGJcdZiWXCeLrtLnnTbMtm3fQSWmpump": {
     "name": "United States Water Reserve (USWR)",
     "firstSeen": "2026-08-18T16:32:35.577Z",
-    "high": 0.006276261024635642
+    "high": 0.006597737845696412,
+    "startPrice": 0.003120280258167317
   }
 }
