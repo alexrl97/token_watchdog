@@ -16,6 +16,7 @@ const { Keypair, Connection, VersionedTransaction } = require("@solana/web3.js")
 const { TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID } = require("@solana/spl-token");
 const bs58 = require("bs58");
 
+const STOP_M5_PCT = -10; // Verkauf: 5m-Änderung <= -10 % (schnellster Dump-Trigger)
 const STOP_H1_PCT = -10; // Verkauf: 1h-Änderung <= -10 %
 const TRAIL_DD_PCT = 15; // Verkauf: >= 15 % unter dem Hoch seit Erstsichtung
 const HIGH_PERSIST_STEP = 1.02; // Hoch erst ab +2 % neu speichern (weniger Commits)
@@ -82,10 +83,7 @@ async function sellAll(keypair, mint, rawAmount) {
   return result.signature;
 }
 
-async function main() {
-  const checkOnly = process.argv.includes("--check");
-  const keypair = loadKeypair();
-  const connection = new Connection(RPC_URL, "confirmed");
+async function runOnce(keypair, connection, checkOnly) {
   const positions = loadPositions();
   let stateChanged = false;
 
@@ -121,6 +119,7 @@ async function main() {
 
   for (const acc of held) {
     let h1 = null,
+      m5 = null,
       priceUsd = 0,
       name = acc.mint;
     try {
@@ -130,6 +129,7 @@ async function main() {
         name = `${t.name} (${t.symbol})`;
         priceUsd = t.usdPrice || 0;
         h1 = t.stats1h && typeof t.stats1h.priceChange === "number" ? t.stats1h.priceChange : null;
+        m5 = t.stats5m && typeof t.stats5m.priceChange === "number" ? t.stats5m.priceChange : null;
       }
     } catch (err) {
       console.log(`${acc.mint}: Datenabruf fehlgeschlagen (${err.message}) — übersprungen`);
@@ -156,11 +156,13 @@ async function main() {
     const ddFromHigh = pos.high > 0 ? (priceUsd / pos.high - 1) * 100 : 0;
 
     const tag =
+      `5m: ${m5 == null ? "n/a" : m5.toFixed(1) + "%"} | ` +
       `1h: ${h1 == null ? "n/a" : h1.toFixed(1) + "%"} | ` +
       `vom Hoch: ${ddFromHigh.toFixed(1)}% | ~$${valueUsd.toFixed(2)}`;
 
     let reason = null;
-    if (h1 != null && h1 <= STOP_H1_PCT) reason = `STOP-LOSS (1h ${h1.toFixed(1)}%)`;
+    if (m5 != null && m5 <= STOP_M5_PCT) reason = `STOP-5M (5m ${m5.toFixed(1)}%)`;
+    else if (h1 != null && h1 <= STOP_H1_PCT) reason = `STOP-LOSS (1h ${h1.toFixed(1)}%)`;
     else if (ddFromHigh <= -TRAIL_DD_PCT)
       reason = `TRAILING-STOP (${ddFromHigh.toFixed(1)}% vom Hoch)`;
 
@@ -184,6 +186,40 @@ async function main() {
   }
 
   if (stateChanged) savePositions(positions);
+}
+
+// Interner Poll-Loop: ein externer Trigger (alle 5 min) startet EINEN Job, der
+// dann über WATCHDOG_LOOP_SECONDS hinweg alle WATCHDOG_INTERVAL_SECONDS prüft.
+// So gibt es echtes ~1-Min-Polling ohne pro Minute einen GitHub-Run zu starten.
+// Ohne die Env-Variablen (loop<=0) läuft der Wächter wie bisher genau einmal.
+async function main() {
+  const checkOnly = process.argv.includes("--check");
+  const keypair = loadKeypair();
+  const connection = new Connection(RPC_URL, "confirmed");
+  const loopSec = Number(process.env.WATCHDOG_LOOP_SECONDS || 0);
+  const intervalSec = Number(process.env.WATCHDOG_INTERVAL_SECONDS || 70);
+
+  if (!(loopSec > 0)) {
+    await runOnce(keypair, connection, checkOnly);
+    return;
+  }
+
+  const startMs = Date.now();
+  let i = 0;
+  while (Date.now() - startMs < loopSec * 1000) {
+    i++;
+    const tSec = Math.round((Date.now() - startMs) / 1000);
+    console.log(`--- Iteration ${i} (t+${tSec}s / ${loopSec}s, Intervall ${intervalSec}s) ---`);
+    try {
+      await runOnce(keypair, connection, checkOnly);
+    } catch (err) {
+      console.error("Iteration-Fehler:", err.message);
+    }
+    // vor Ablauf des Fensters nicht noch einen vollen Intervall-Schlaf starten
+    if (Date.now() - startMs + intervalSec * 1000 >= loopSec * 1000) break;
+    await new Promise((r) => setTimeout(r, intervalSec * 1000));
+  }
+  console.log(`Loop beendet nach ${i} Iteration(en).`);
 }
 
 main().catch((err) => {

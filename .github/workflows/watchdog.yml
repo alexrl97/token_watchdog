@@ -23,6 +23,7 @@ concurrency:
 jobs:
   watch:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -34,6 +35,10 @@ jobs:
         env:
           FAMILY_WALLET_PRIVATE_KEY: ${{ secrets.FAMILY_WALLET_PRIVATE_KEY }}
           RPC_URL: ${{ secrets.RPC_URL }}
+          # Interner Poll-Loop: ~4:50 min lang alle 70 s prüfen (≈5 Checks/Job).
+          # Ein externer Trigger alle 5 min ergibt so lückenloses ~70-s-Polling.
+          WATCHDOG_LOOP_SECONDS: "290"
+          WATCHDOG_INTERVAL_SECONDS: "70"
         run: node watchdog.js
 
       - name: Trailing-State committen
