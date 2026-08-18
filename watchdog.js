@@ -19,6 +19,10 @@ const bs58 = require("bs58");
 const STOP_M5_PCT = -10; // Verkauf: 5m-Änderung <= -10 % (schnellster Dump-Trigger)
 const STOP_H1_PCT = -10; // Verkauf: 1h-Änderung <= -10 %
 const TRAIL_DD_PCT = 15; // Verkauf: >= 15 % unter dem Hoch seit Erstsichtung
+// v3: "Zu-heiß"-Take-Profit. Referenz = Open der ersten AMM-Kerze (Migration), also der
+// Wert, den Phantom im Tageschart zeigt (kalibriert: Phantom +95% = +98% ab erster Kerze).
+// Ab +250% seit Start gilt der Token als überhitzt/rug-gefährdet -> verkaufen.
+const TOO_HOT_MULT = 3.5; // Kurs >= 3.5x der ersten Kerze = +250%
 const HIGH_PERSIST_STEP = 1.02; // Hoch erst ab +2 % neu speichern (weniger Commits)
 const MIN_VALUE_USD = 0.5; // Staub ignorieren
 const SOL_MINT = "So11111111111111111111111111111111111111112";
@@ -81,6 +85,34 @@ async function sellAll(keypair, mint, rawAmount) {
   });
   if (result.status !== "Success") throw new Error(`Status ${result.status}`);
   return result.signature;
+}
+
+// v3: Open der ERSTEN AMM-Kerze (Migrationspreis) = Referenz für "seit Start"-%,
+// so wie Phantom es zeigt. Wird pro Position genau EINMAL geholt und in positions.json
+// gecached. Gibt Preis oder null (dann bleibt die Zu-heiß-Regel für die Position inaktiv).
+async function fetchStartPrice(mint) {
+  let pool = null, mig = null;
+  try {
+    const j = await fetch(`https://frontend-api-v3.pump.fun/coins/${mint}`).then((r) => r.json());
+    if (j && j.pump_swap_pool) pool = j.pump_swap_pool;
+  } catch {}
+  try {
+    const d = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${mint}`).then((r) => r.json());
+    const p = (d.pairs || [])
+      .filter((x) => x.chainId === "solana")
+      .sort((a, b) => (a.pairCreatedAt || 0) - (b.pairCreatedAt || 0))[0];
+    if (p) { if (!pool) pool = p.pairAddress; if (p.pairCreatedAt) mig = Math.floor(p.pairCreatedAt / 1000); }
+  } catch {}
+  if (!pool) return null;
+  try {
+    const before = mig ? mig + 3600 : Math.floor(Date.now() / 1000);
+    const url = `https://api.geckoterminal.com/api/v2/networks/solana/pools/${pool}/ohlcv/minute?aggregate=1&limit=50&currency=usd&before_timestamp=${before}`;
+    const g = await fetch(url, { headers: { Accept: "application/json" } }).then((r) => r.json());
+    const list = (((g.data || {}).attributes || {}).ohlcv_list || []).sort((a, b) => a[0] - b[0]);
+    return list.length ? list[0][1] : null; // Open der ersten Kerze
+  } catch {
+    return null;
+  }
 }
 
 // Gehaltene Positionen per RPC ermitteln (schwerer Call — nur selten aufrufen).
@@ -155,23 +187,34 @@ async function checkHeld(keypair, held, positions, checkOnly, quiet) {
       stateChanged = true;
     }
     const pos = positions[acc.mint];
+    // v3: Referenzpreis (erste AMM-Kerze) genau einmal holen + cachen (max. 3 Versuche).
+    if (pos.startPrice === undefined && (pos.startTries || 0) < 3) {
+      const sp = await fetchStartPrice(acc.mint);
+      if (sp) pos.startPrice = sp;
+      else { pos.startTries = (pos.startTries || 0) + 1; if (pos.startTries >= 3) pos.startPrice = null; }
+      stateChanged = true;
+    }
     if (priceUsd > (pos.high || 0)) {
       // nur in 2%-Schritten persistieren, damit nicht jeder Tick einen Commit erzeugt
       if (priceUsd >= (pos.high || 0) * HIGH_PERSIST_STEP) stateChanged = true;
       pos.high = Math.max(pos.high || 0, priceUsd);
     }
     const ddFromHigh = pos.high > 0 ? (priceUsd / pos.high - 1) * 100 : 0;
+    const runupPct = pos.startPrice ? (priceUsd / pos.startPrice - 1) * 100 : null; // seit erster Kerze
 
     const tag =
       `5m: ${m5 == null ? "n/a" : m5.toFixed(1) + "%"} | ` +
       `1h: ${h1 == null ? "n/a" : h1.toFixed(1) + "%"} | ` +
-      `vom Hoch: ${ddFromHigh.toFixed(1)}% | ~$${valueUsd.toFixed(2)}`;
+      `vom Hoch: ${ddFromHigh.toFixed(1)}% | ` +
+      `seit Start: ${runupPct == null ? "n/a" : "+" + runupPct.toFixed(0) + "%"} | ~$${valueUsd.toFixed(2)}`;
 
     let reason = null;
     if (m5 != null && m5 <= STOP_M5_PCT) reason = `STOP-5M (5m ${m5.toFixed(1)}%)`;
     else if (h1 != null && h1 <= STOP_H1_PCT) reason = `STOP-LOSS (1h ${h1.toFixed(1)}%)`;
     else if (ddFromHigh <= -TRAIL_DD_PCT)
       reason = `TRAILING-STOP (${ddFromHigh.toFixed(1)}% vom Hoch)`;
+    else if (pos.startPrice && priceUsd >= pos.startPrice * TOO_HOT_MULT)
+      reason = `ZU-HEISS (+${runupPct.toFixed(0)}% seit Start)`;
 
     if (!reason) {
       if (!quiet) console.log(`${new Date().toISOString()} ${name} | ${tag} — hält`);
