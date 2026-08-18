@@ -1,1 +1,12 @@
-{}
+{
+  "c9i3hJb5xfq9QJrAs4StGiCGFkysC1s18f7zJArpump": {
+    "name": "United States Water Supply (USWS)",
+    "firstSeen": "2026-08-18T00:10:27.783Z",
+    "high": 0.006493883932219527
+  },
+  "mj2gWUxr17mzCZgXU4SmLNnk1fJZ8JrCYwCxkDYpump": {
+    "name": "United States Food Reserve (USFR)",
+    "firstSeen": "2026-08-18T00:10:27.812Z",
+    "high": 0.0033070175840893942
+  }
+}
