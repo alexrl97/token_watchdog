@@ -35,12 +35,12 @@ jobs:
         env:
           FAMILY_WALLET_PRIVATE_KEY: ${{ secrets.FAMILY_WALLET_PRIVATE_KEY }}
           RPC_URL: ${{ secrets.RPC_URL }}
-          # Interner Poll-Loop: ~25 min lang alle 20 s Preis prüfen. Der schwere
+          # Interner Poll-Loop: ~25 min lang alle 10 s Preis prüfen. Der schwere
           # RPC-Call (gehaltene Positionen) läuft nur alle 5 min → schneller
           # Preis-Check bleibt rate-limit-fest. Extern alle ~20 min triggern:
           # dank concurrency übernimmt der nächste Job nahtlos, Startup nur ~1x/25min.
           WATCHDOG_LOOP_SECONDS: "1500"
-          WATCHDOG_INTERVAL_SECONDS: "20"
+          WATCHDOG_INTERVAL_SECONDS: "10"
           WATCHDOG_RPC_REFRESH_SECONDS: "300"
         run: node watchdog.js
 
