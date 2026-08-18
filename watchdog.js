@@ -22,7 +22,7 @@ const TRAIL_DD_PCT = 15; // Verkauf: >= 15 % unter dem Hoch seit Erstsichtung
 // v3: "Zu-heiß"-Take-Profit. Referenz = Open der ersten AMM-Kerze (Migration), also der
 // Wert, den Phantom im Tageschart zeigt (kalibriert: Phantom +95% = +98% ab erster Kerze).
 // Ab +250% seit Start gilt der Token als überhitzt/rug-gefährdet -> verkaufen.
-const TOO_HOT_MULT = 3.0; // Kurs >= 3.0x der ersten Kerze = +200%
+const TOO_HOT_MULT = 3.25; // Kurs >= 3.25x der ersten Kerze = +225%
 const HIGH_PERSIST_STEP = 1.02; // Hoch erst ab +2 % neu speichern (weniger Commits)
 const MIN_VALUE_USD = 0.5; // Staub ignorieren
 const SOL_MINT = "So11111111111111111111111111111111111111112";
