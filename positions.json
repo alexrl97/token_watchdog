@@ -1,17 +1,7 @@
 {
-  "chjJ3eFt1NiMXceTS9zZL1qv647ZxxwHhHAbJfxpump": {
-    "name": "United States Water Reserve (USWR)",
-    "firstSeen": "2026-08-19T08:27:16.202Z",
-    "high": 0.009508519514976154
-  },
   "gHgN2kH5VJbgZPBgGzGFaprJi2LhFQeu1pXF6YRpump": {
     "name": "United Oil Trust Fund (UOTF)",
     "firstSeen": "2026-08-19T10:39:31.808Z",
-    "high": 0.0060580833896695845
-  },
-  "jrVJXnBA8JWSzM6FsGoHCeHcyEBuw1wsdTGriMQpump": {
-    "name": "United States Water Supply (USWS)",
-    "firstSeen": "2026-08-19T12:20:51.004Z",
-    "high": 0.00975666414945168
+    "high": 0.006245661831446784
   }
 }
