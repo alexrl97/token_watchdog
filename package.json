@@ -6,7 +6,8 @@
   "main": "watchdog.js",
   "scripts": {
     "start": "node watchdog.js",
-    "check": "node watchdog.js --check"
+    "check": "node watchdog.js --check",
+    "test": "node test/watchdog.test.js"
   },
   "dependencies": {
     "@solana/spl-token": "^0.4.9",

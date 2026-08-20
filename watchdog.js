@@ -26,6 +26,18 @@ const HIGH_PERSIST_STEP = 1.02; // Hoch erst ab +2 % neu speichern (weniger Comm
 const MIN_VALUE_USD = 0.5; // Staub ignorieren
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 const JUPITER = "https://lite-api.jup.ag";
+
+/**
+ * PURE Verkaufs-Entscheidung. Reihenfolge = Priorität. Gibt den Grund-String oder null
+ * (halten). Ausgelagert, damit die drei Stop-Regeln testbar sind.
+ */
+function sellReason(m5, h1, ddFromHigh) {
+  if (m5 != null && m5 <= STOP_M5_PCT) return `STOP-5M (5m ${m5.toFixed(1)}%)`;
+  if (h1 != null && h1 <= STOP_H1_PCT) return `STOP-LOSS (1h ${h1.toFixed(1)}%)`;
+  if (ddFromHigh <= -TRAIL_DD_PCT) return `TRAILING-STOP (${ddFromHigh.toFixed(1)}% vom Hoch)`;
+  return null;
+}
+if (require.main !== module) module.exports = { sellReason, STOP_M5_PCT, STOP_H1_PCT, TRAIL_DD_PCT };
 const RPC_URL = process.env.RPC_URL || "https://api.mainnet-beta.solana.com";
 const POSITIONS_FILE = path.join(__dirname, "positions.json");
 
@@ -170,11 +182,7 @@ async function checkHeld(keypair, held, positions, checkOnly, quiet) {
       `1h: ${h1 == null ? "n/a" : h1.toFixed(1) + "%"} | ` +
       `vom Hoch: ${ddFromHigh.toFixed(1)}% | ~$${valueUsd.toFixed(2)}`;
 
-    let reason = null;
-    if (m5 != null && m5 <= STOP_M5_PCT) reason = `STOP-5M (5m ${m5.toFixed(1)}%)`;
-    else if (h1 != null && h1 <= STOP_H1_PCT) reason = `STOP-LOSS (1h ${h1.toFixed(1)}%)`;
-    else if (ddFromHigh <= -TRAIL_DD_PCT)
-      reason = `TRAILING-STOP (${ddFromHigh.toFixed(1)}% vom Hoch)`;
+    const reason = sellReason(m5, h1, ddFromHigh);
 
     if (!reason) {
       if (!quiet) console.log(`${new Date().toISOString()} ${name} | ${tag} — hält`);
@@ -255,7 +263,10 @@ async function main() {
   console.log(`Loop beendet nach ${i} Check(s).`);
 }
 
-main().catch((err) => {
-  console.error("WÄCHTER-FEHLER:", err.message);
-  process.exit(1);
-});
+// Nur als Skript ausführen; beim require (Tests) NICHT den Poll-Loop starten.
+if (require.main === module) {
+  main().catch((err) => {
+    console.error("WÄCHTER-FEHLER:", err.message);
+    process.exit(1);
+  });
+}
