@@ -1,12 +1,12 @@
 {
-  "yYpNf4meWc8YVBnzKyQpC1roVP5pc4ur5UEfYXupump": {
-    "name": "United States Food Reserve (USFR)",
-    "firstSeen": "2026-08-21T14:28:54.660Z",
-    "high": 0.011863832009455889
-  },
   "FMe8ZkspumcDDPEoKtxq7GnB2ewhPHvNWtEhGqqApump": {
     "name": "Catecoin (CATE)",
     "firstSeen": "2026-08-21T18:42:05.481Z",
-    "high": 0.007422807785280992
+    "high": 0.007704315309967487
+  },
+  "5qedy1g1MKmprqArR7J4QK5tQgzQrjyPsuLa3LpQpump": {
+    "name": "United Oil Trust Fund (UOTF)",
+    "firstSeen": "2026-08-21T20:23:22.152Z",
+    "high": 0.134144254974339
   }
 }
