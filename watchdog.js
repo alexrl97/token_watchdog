@@ -4,18 +4,25 @@
 //                   (Distribution — nicht zwangsläufig ein Rug).
 //   - Trailing:     Kurs fällt >= 15 % unter das beobachtete Hoch seit Erstsichtung
 //                   -> diese Position verkaufen (Gewinne sichern).
-//   - NOTAUS:       bricht IRGENDEINE gehaltene (nicht-Staub) Position um <= -50 % in
-//                   5m ODER 1h ein -> ALLE gehaltenen Positionen sofort verkaufen
-//                   (Signal für einen korrelierten Meta-Rug).
+//   - NOTAUS:       bricht IRGENDEINE gehaltene (nicht-Staub) Position ODER ein gerade
+//                   erst vom Wächter verkaufter Token um <= -50 % in 5m ODER 1h ein
+//                   -> ALLE gehaltenen Positionen sofort verkaufen (korrelierter Meta-Rug).
+//
+// NACHBEOBACHTUNG (schließt die Lücke "erst -10%-Stop, 5 min später Total-Rug"):
+//   Verkauft der Wächter eine Position (Stop/Trailing), merkt er sich den Mint in
+//   state.exited und beobachtet ihn PANIC_WATCH_MS (30 min) WEITER. Ruggt der Token
+//   danach komplett (<= -50 %), löst er den Notaus für die übrigen Positionen aus —
+//   obwohl er schon aus dem Wallet geflogen ist. Nach einem Notaus wird state.exited
+//   geleert (einmaliger Trigger, keine Dauerauslösung).
 //
 // WICHTIG — was den Notaus NICHT auslöst:
-//   Der Wächter betrachtet AUSSCHLIESSLICH aktuell gehaltene Positionen (per RPC aus
-//   dem Wallet). Bereits vom Bot verkaufte Token stehen nicht mehr im Wallet und können
-//   daher keinen Notaus auslösen — es wird nur verkauft, wenn ein Token IM Haltefenster
-//   ruggt. Staub-Reste bereits verkaufter Rug-Token (< MIN_VALUE_USD) sind vom
-//   Notaus-Trigger ausgenommen, damit nicht "irgendein alter Token" das ganze Wallet leert.
+//   Nur (a) aktuell GEHALTENE Positionen (per RPC) und (b) vom WÄCHTER SELBST in den
+//   letzten 30 min verkaufte Token. Vom Bot regulär (6h-Frist) verkaufte Token und alte/
+//   zufällige Token werden NIE nachbeobachtet -> "irgendein alter Token" leert das Wallet
+//   nicht. Staub-Reste (< MIN_VALUE_USD) sind vom gehaltenen Trigger ausgenommen.
 //
-// Das Hoch je Position wird in positions.json geführt (vom Workflow committet).
+// State (positions.json, vom Workflow committet): { positions: {Trailing-Hoch je gehaltene
+// Position}, exited: {Mint -> {name, exitedAt} der zuletzt verkauften} }.
 //
 // Aufruf: node watchdog.js [--check]   (--check: nur anzeigen, nicht verkaufen)
 try {
@@ -31,7 +38,12 @@ const bs58 = require("bs58");
 const STOP_M5_PCT = -10; // Einzel-Verkauf: 5m-Änderung <= -10 % (schnellster Dump-Trigger)
 const STOP_H1_PCT = -10; // Einzel-Verkauf: 1h-Änderung <= -10 %
 const TRAIL_DD_PCT = 15; // Einzel-Verkauf: >= 15 % unter dem Hoch seit Erstsichtung
-const PANIC_PCT = -50; // NOTAUS: gehaltene (nicht-Staub) Position <= -50 % in 5m ODER 1h -> ALLES
+const PANIC_PCT = -50; // NOTAUS: Position <= -50 % in 5m ODER 1h -> ALLES verkaufen
+// Ein Token, das der WÄCHTER selbst gerade (unter Stress) verkauft hat, wird noch so lange
+// weiter beobachtet: ruggt es DANACH komplett (<= PANIC_PCT), löst es den Notaus für die
+// übrigen Positionen aus — auch wenn es schon aus dem Wallet geflogen ist. Kurz gehalten,
+// damit KEIN alter/zufälliger Token das Wallet leert; deckt "5 min später komplett geruggt" ab.
+const PANIC_WATCH_MS = 30 * 60 * 1000; // 30 min
 // Der "Zu-heiß"-Take-Profit wurde ENTFERNT: das Nicht-zu-hoch-Kaufen ist beim Kauf
 // gelöst (Runup-Gate ab erster Kerze im Bot), ein Verkaufs-Deckel würde nur die
 // seltenen Mega-Runner abschneiden (Fat-Tail-Killer).
@@ -75,8 +87,25 @@ function findPanic(records) {
   }
   return null;
 }
+
+/**
+ * PURE: entfernt aus `exited` (Mint -> {name, exitedAt}) alle Einträge, deren Verkauf länger
+ * als windowMs her ist. Gibt true, wenn etwas entfernt wurde. So bleibt das Nachbeobachten
+ * strikt zeitlich begrenzt (kein alter Token kann später fälschlich den Notaus auslösen).
+ */
+function pruneExited(exited, nowMs, windowMs) {
+  let changed = false;
+  for (const [mint, r] of Object.entries(exited || {})) {
+    const t = r && r.exitedAt ? new Date(r.exitedAt).getTime() : 0;
+    if (!(nowMs - t < windowMs)) {
+      delete exited[mint];
+      changed = true;
+    }
+  }
+  return changed;
+}
 if (require.main !== module)
-  module.exports = { sellReason, panicReason, findPanic, STOP_M5_PCT, STOP_H1_PCT, TRAIL_DD_PCT, PANIC_PCT };
+  module.exports = { sellReason, panicReason, findPanic, pruneExited, STOP_M5_PCT, STOP_H1_PCT, TRAIL_DD_PCT, PANIC_PCT, PANIC_WATCH_MS };
 const RPC_URL = process.env.RPC_URL || "https://api.mainnet-beta.solana.com";
 const POSITIONS_FILE = path.join(__dirname, "positions.json");
 
@@ -87,16 +116,24 @@ function loadKeypair() {
   return Keypair.fromSecretKey(decode(key.trim()));
 }
 
-function loadPositions() {
+// State = { positions: {Mint -> Trailing-Hoch der GEHALTENEN}, exited: {Mint -> {name, exitedAt}
+// der zuletzt vom Wächter verkauften} }. Migriert das alte flache Format (nur positions).
+function loadState() {
   try {
-    return JSON.parse(fs.readFileSync(POSITIONS_FILE, "utf8"));
+    const raw = JSON.parse(fs.readFileSync(POSITIONS_FILE, "utf8"));
+    if (raw && typeof raw === "object" && (raw.positions || raw.exited)) {
+      return { positions: raw.positions || {}, exited: raw.exited || {} };
+    }
+    // Legacy: flache Mint-Map -> als positions übernehmen
+    return { positions: raw && typeof raw === "object" ? raw : {}, exited: {} };
   } catch {
-    return {};
+    return { positions: {}, exited: {} };
   }
 }
 
-function savePositions(p) {
-  fs.writeFileSync(POSITIONS_FILE, JSON.stringify(p, null, 2) + "\n", "utf8");
+function saveState(state) {
+  const out = { positions: state.positions || {}, exited: state.exited || {} };
+  fs.writeFileSync(POSITIONS_FILE, JSON.stringify(out, null, 2) + "\n", "utf8");
 }
 
 async function fetchJson(url, opts) {
@@ -156,13 +193,39 @@ async function fetchHeld(connection, keypair) {
   return held;
 }
 
-// Preis-Check + ggf. Verkauf für die aktuell bekannten Positionen (leichter Teil,
-// nur Jupiter). Mutiert positions UND held (Verkauftes wird entfernt). Gibt zurück,
-// ob sich der Trailing-State geändert hat. `quiet` unterdrückt Halte-Zeilen.
-async function checkHeld(keypair, held, positions, checkOnly, quiet) {
-  let stateChanged = false;
+// Kursdaten eines Mints (name, priceUsd, m5, h1) + fetchOk. Zentral genutzt für gehaltene
+// UND nachbeobachtete (bereits verkaufte) Mints.
+async function fetchStats(mint) {
+  try {
+    const list = await fetchJson(`${JUPITER}/tokens/v2/search?query=${mint}`);
+    const t = Array.isArray(list) ? list.find((x) => x.id === mint) : null;
+    if (t) {
+      return {
+        name: `${t.name} (${t.symbol})`,
+        priceUsd: t.usdPrice || 0,
+        m5: t.stats5m && typeof t.stats5m.priceChange === "number" ? t.stats5m.priceChange : null,
+        h1: t.stats1h && typeof t.stats1h.priceChange === "number" ? t.stats1h.priceChange : null,
+        fetchOk: true,
+      };
+    }
+    return { name: mint, priceUsd: 0, m5: null, h1: null, fetchOk: true };
+  } catch {
+    return { name: mint, priceUsd: 0, m5: null, h1: null, fetchOk: false };
+  }
+}
 
-  // State von nicht mehr gehaltenen Positionen aufräumen
+// Preis-Check + ggf. Verkauf. Mutiert state (positions/exited) UND held (Verkauftes wird
+// entfernt). Gibt zurück, ob sich der State geändert hat. `quiet` unterdrückt Halte-Zeilen.
+async function checkHeld(keypair, held, state, checkOnly, quiet) {
+  const positions = state.positions;
+  const exited = state.exited;
+  let stateChanged = false;
+  const nowMs = Date.now();
+
+  // Abgelaufene Nachbeobachtungen entfernen (strikt auf PANIC_WATCH_MS begrenzt)
+  if (pruneExited(exited, nowMs, PANIC_WATCH_MS)) stateChanged = true;
+
+  // Trailing-State nicht mehr gehaltener Positionen aufräumen
   const heldMints = new Set(held.map((h) => h.mint));
   for (const mint of Object.keys(positions)) {
     if (!heldMints.has(mint)) {
@@ -173,68 +236,62 @@ async function checkHeld(keypair, held, positions, checkOnly, quiet) {
 
   if (held.length === 0) {
     if (!quiet) console.log(`${new Date().toISOString()} Wächter: keine Positionen.`);
-    return stateChanged;
+    return stateChanged; // nichts gehalten -> Notaus wäre wirkungslos
   }
 
-  // PASS 1: Für jede gehaltene Position Kursdaten holen und (bei nicht-Staub) das
-  // Trailing-Hoch pflegen. Ergebnis ist eine angereicherte Liste, auf der DANACH
-  // erst der Portfolio-Notaus und dann die Einzel-Stops entscheiden.
+  // PASS 1: gehaltene Positionen anreichern + Trailing-Hoch pflegen.
   const enriched = [];
   for (const acc of held) {
-    let h1 = null,
-      m5 = null,
-      priceUsd = 0,
-      name = acc.mint,
-      fetchOk = false;
-    try {
-      const list = await fetchJson(`${JUPITER}/tokens/v2/search?query=${acc.mint}`);
-      const t = Array.isArray(list) ? list.find((x) => x.id === acc.mint) : null;
-      if (t) {
-        name = `${t.name} (${t.symbol})`;
-        priceUsd = t.usdPrice || 0;
-        h1 = t.stats1h && typeof t.stats1h.priceChange === "number" ? t.stats1h.priceChange : null;
-        m5 = t.stats5m && typeof t.stats5m.priceChange === "number" ? t.stats5m.priceChange : null;
-      }
-      fetchOk = true;
-    } catch (err) {
-      if (!quiet) console.log(`${acc.mint}: Datenabruf fehlgeschlagen (${err.message}) — übersprungen`);
-    }
-
+    const s = await fetchStats(acc.mint);
+    if (!s.fetchOk && !quiet) console.log(`${acc.mint}: Datenabruf fehlgeschlagen — übersprungen`);
+    const priceUsd = s.priceUsd;
     const valueUsd = (acc.uiAmount || 0) * priceUsd;
     const dust = valueUsd < MIN_VALUE_USD;
     let ddFromHigh = 0;
 
-    // Trailing-Hoch nur für echte (nicht-Staub, mit Kursdaten) Positionen führen.
-    if (fetchOk && !dust) {
+    if (s.fetchOk && !dust) {
       if (!positions[acc.mint]) {
-        positions[acc.mint] = { name, firstSeen: new Date().toISOString(), high: priceUsd };
+        positions[acc.mint] = { name: s.name, firstSeen: new Date().toISOString(), high: priceUsd };
         stateChanged = true;
       }
       const pos = positions[acc.mint];
       if (priceUsd > (pos.high || 0)) {
-        // nur in 2%-Schritten persistieren, damit nicht jeder Tick einen Commit erzeugt
         if (priceUsd >= (pos.high || 0) * HIGH_PERSIST_STEP) stateChanged = true;
         pos.high = Math.max(pos.high || 0, priceUsd);
       }
       ddFromHigh = pos.high > 0 ? (priceUsd / pos.high - 1) * 100 : 0;
     }
 
-    enriched.push({ acc, name, m5, h1, priceUsd, valueUsd, dust, fetchOk, ddFromHigh });
+    enriched.push({ acc, name: s.name, m5: s.m5, h1: s.h1, priceUsd, valueUsd, dust, fetchOk: s.fetchOk, ddFromHigh });
+  }
+
+  // PASS 1b: kürzlich VOM WÄCHTER verkaufte Mints (nicht mehr gehalten) nachbeobachten.
+  // Ruggt so ein Token NACH dem Verkauf (<= -50 %), löst es den Notaus für die übrigen
+  // Positionen aus. Dust-Ausnahme gilt hier NICHT — wir wissen, dass diese Mints relevant sind.
+  const exitedRecords = [];
+  for (const mint of Object.keys(exited)) {
+    if (heldMints.has(mint)) continue; // wieder gehalten -> steckt schon in enriched
+    const s = await fetchStats(mint);
+    exitedRecords.push({ name: `${(exited[mint] && exited[mint].name) || mint} [verkauft]`, m5: s.m5, h1: s.h1, dust: false, fetchOk: s.fetchOk });
   }
 
   const fmtTag = (r) =>
     `5m: ${r.m5 == null ? "n/a" : r.m5.toFixed(1) + "%"} | ` +
-    `1h: ${r.h1 == null ? "n/a" : r.h1.toFixed(1) + "%"} | ` +
-    `vom Hoch: ${r.ddFromHigh.toFixed(1)}% | ~$${r.valueUsd.toFixed(2)}`;
+    `1h: ${r.h1 == null ? "n/a" : r.h1.toFixed(1) + "%"}` +
+    (r.ddFromHigh != null ? ` | vom Hoch: ${r.ddFromHigh.toFixed(1)}%` : "") +
+    (r.valueUsd != null ? ` | ~$${r.valueUsd.toFixed(2)}` : "");
 
-  // Verkauft eine Position; pflegt positions/held/stateChanged. Gibt true bei Erfolg.
-  const doSell = async (acc, label) => {
+  // Verkauft eine Position; pflegt positions/exited/held/stateChanged. Gibt true bei Erfolg.
+  // Ein Verkauf trägt den Mint in `exited` ein -> er wird ab jetzt (PANIC_WATCH_MS lang)
+  // nachbeobachtet: ruggt er danach komplett, löst er den Notaus für den Rest aus.
+  const doSell = async (acc, name, label) => {
     console.log(`${new Date().toISOString()} ${label}${checkOnly ? " (nur Check)" : ", verkaufe"}`);
     if (checkOnly) return false;
     try {
       const sig = await sellAll(keypair, acc.mint, acc.rawAmount);
       console.log(`  -> verkauft (${sig})`);
       delete positions[acc.mint];
+      exited[acc.mint] = { name, exitedAt: new Date().toISOString() };
       const idx = held.indexOf(acc);
       if (idx >= 0) held.splice(idx, 1);
       stateChanged = true;
@@ -247,10 +304,9 @@ async function checkHeld(keypair, held, positions, checkOnly, quiet) {
     }
   };
 
-  // NOTAUS (Priorität 1): bricht IRGENDEINE gehaltene, nicht-Staub-Position um <= -50 %
-  // in 5m ODER 1h ein -> ALLE (nicht-Staub-)Positionen sofort verkaufen. Staub und
-  // Positionen ohne Kursdaten lösen NICHTS aus (findPanic filtert das).
-  const panic = findPanic(enriched);
+  // NOTAUS (Priorität 1): irgendeine gehaltene (nicht-Staub) ODER kürzlich verkaufte Position
+  // <= -50 % in 5m ODER 1h -> ALLE gehaltenen (nicht-Staub-)Positionen sofort verkaufen.
+  const panic = findPanic([...enriched, ...exitedRecords]);
   if (panic) {
     console.log(
       `${new Date().toISOString()} !!! NOTAUS !!! Auslöser: ${panic.rec.name} | ${fmtTag(panic.rec)} ` +
@@ -262,8 +318,12 @@ async function checkHeld(keypair, held, positions, checkOnly, quiet) {
         if (!quiet) console.log(`${new Date().toISOString()} ${r.name} | ~$${r.valueUsd.toFixed(2)} — Staub, übersprungen`);
         continue;
       }
-      await doSell(r.acc, `NOTAUS-Verkauf ${r.name} | ${fmtTag(r)}`);
+      await doSell(r.acc, r.name, `NOTAUS-Verkauf ${r.name} | ${fmtTag(r)}`);
     }
+    // Nachbeobachtungen leeren (Zweck erfüllt, Portfolio ist flach) — verhindert, dass ein
+    // dauerhaft -50%-Token bei jedem Tick erneut auslöst und spätere Käufe sofort dumpt.
+    for (const m of Object.keys(exited)) delete exited[m];
+    stateChanged = true;
     return stateChanged;
   }
 
@@ -280,7 +340,7 @@ async function checkHeld(keypair, held, positions, checkOnly, quiet) {
       continue;
     }
     // Verkaufsgrund wird IMMER geloggt (auch im quiet-Modus)
-    await doSell(r.acc, `${r.name} | ${fmtTag(r)} — ${reason}`);
+    await doSell(r.acc, r.name, `${r.name} | ${fmtTag(r)} — ${reason}`);
   }
 
   return stateChanged;
@@ -298,11 +358,11 @@ async function main() {
   const loopSec = Number(process.env.WATCHDOG_LOOP_SECONDS || 0);
   const intervalSec = Number(process.env.WATCHDOG_INTERVAL_SECONDS || 20);
   const rpcRefreshMs = Number(process.env.WATCHDOG_RPC_REFRESH_SECONDS || 300) * 1000;
-  const positions = loadPositions();
+  const state = loadState();
 
   if (!(loopSec > 0)) {
     const held = await fetchHeld(connection, keypair);
-    if (await checkHeld(keypair, held, positions, checkOnly, false)) savePositions(positions);
+    if (await checkHeld(keypair, held, state, checkOnly, false)) saveState(state);
     return;
   }
 
@@ -330,14 +390,14 @@ async function main() {
     try {
       // Halte-Zeilen nur bei RPC-Refresh loggen (sonst würden 20s-Ticks das Log fluten);
       // Verkäufe werden immer geloggt.
-      if (await checkHeld(keypair, held, positions, checkOnly, !refreshed)) savePositions(positions);
+      if (await checkHeld(keypair, held, state, checkOnly, !refreshed)) saveState(state);
     } catch (err) {
       console.error("Check-Fehler:", err.message);
     }
     if (Date.now() - startMs + intervalSec * 1000 >= loopSec * 1000) break;
     await new Promise((r) => setTimeout(r, intervalSec * 1000));
   }
-  savePositions(positions);
+  saveState(state);
   console.log(`Loop beendet nach ${i} Check(s).`);
 }
 

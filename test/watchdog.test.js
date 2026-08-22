@@ -7,10 +7,12 @@ const {
   sellReason,
   panicReason,
   findPanic,
+  pruneExited,
   STOP_M5_PCT,
   STOP_H1_PCT,
   TRAIL_DD_PCT,
   PANIC_PCT,
+  PANIC_WATCH_MS,
 } = require("../watchdog");
 
 let passed = 0,
@@ -97,6 +99,50 @@ test("normaler -10%-Dip (Einzel-Stop) löst KEINEN Notaus aus", () => {
   // -10% verkauft nur die eine Position (sellReason), NICHT das ganze Wallet.
   const r = findPanic([rec({ m5: -12, h1: -10 })]);
   assert.equal(r, null);
+});
+
+console.log("\nwatchdog findPanic — Nachbeobachtung verkaufter Token");
+
+test("SZENARIO: -10%-Stop, dann Total-Rug -> verkaufter Token löst Notaus aus", () => {
+  // gehaltene Restposition ist gesund (-4%), aber der GERADE VERKAUFTE Token ruggt (-70%)
+  // -> Notaus. exited-Records tragen dust:false -> zählen als Auslöser.
+  const held = rec({ name: "B gehalten", m5: -4, h1: 2 });
+  const exitedRug = rec({ name: "A [verkauft]", m5: -70, dust: false });
+  const hit = findPanic([held, exitedRug]);
+  assert.ok(hit && hit.rec.name === "A [verkauft]", "verkaufter Rug muss auslösen");
+});
+
+test("verkaufter Token gesund (kein Rug danach) -> kein Notaus", () => {
+  const r = findPanic([rec({ name: "gehalten", m5: 1 }), rec({ name: "A [verkauft]", m5: -8, h1: -5 })]);
+  assert.equal(r, null);
+});
+
+console.log("\nwatchdog pruneExited — Nachbeobachtung zeitlich begrenzt");
+
+test("Notaus-Fenster ist 30 min", () => assert.equal(PANIC_WATCH_MS, 30 * 60 * 1000));
+
+test("frischer Eintrag (< 30 min) bleibt, alter (> 30 min) fliegt raus", () => {
+  const now = 1_000_000_000_000;
+  const exited = {
+    frisch: { name: "frisch", exitedAt: new Date(now - 5 * 60 * 1000).toISOString() }, // 5 min
+    alt: { name: "alt", exitedAt: new Date(now - 45 * 60 * 1000).toISOString() }, // 45 min
+  };
+  const changed = pruneExited(exited, now, PANIC_WATCH_MS);
+  assert.ok(changed);
+  assert.ok(exited.frisch && !exited.alt, "nur der alte Eintrag wird entfernt");
+});
+
+test("KRITISCH: alter verkaufter Token (> 30 min) wird nicht mehr beobachtet -> kein Fehl-Notaus", () => {
+  const now = 1_000_000_000_000;
+  const exited = { alt: { name: "alt-rug", exitedAt: new Date(now - 2 * 60 * 60 * 1000).toISOString() } }; // 2h
+  pruneExited(exited, now, PANIC_WATCH_MS);
+  assert.equal(Object.keys(exited).length, 0);
+});
+
+test("pruneExited ohne Änderung -> false", () => {
+  const now = 1_000_000_000_000;
+  const exited = { a: { name: "a", exitedAt: new Date(now - 60 * 1000).toISOString() } };
+  assert.equal(pruneExited(exited, now, PANIC_WATCH_MS), false);
 });
 
 console.log(`\n${passed} bestanden, ${failed} fehlgeschlagen\n`);
