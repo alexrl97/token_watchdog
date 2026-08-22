@@ -119,22 +119,22 @@ test("verkaufter Token gesund (kein Rug danach) -> kein Notaus", () => {
 
 console.log("\nwatchdog pruneExited — Nachbeobachtung zeitlich begrenzt");
 
-test("Notaus-Fenster ist 30 min", () => assert.equal(PANIC_WATCH_MS, 30 * 60 * 1000));
+test("Notaus-Fenster ist 5 min", () => assert.equal(PANIC_WATCH_MS, 5 * 60 * 1000));
 
-test("frischer Eintrag (< 30 min) bleibt, alter (> 30 min) fliegt raus", () => {
+test("frischer Eintrag (< 5 min) bleibt, alter (> 5 min) fliegt raus", () => {
   const now = 1_000_000_000_000;
   const exited = {
-    frisch: { name: "frisch", exitedAt: new Date(now - 5 * 60 * 1000).toISOString() }, // 5 min
-    alt: { name: "alt", exitedAt: new Date(now - 45 * 60 * 1000).toISOString() }, // 45 min
+    frisch: { name: "frisch", exitedAt: new Date(now - 2 * 60 * 1000).toISOString() }, // 2 min
+    alt: { name: "alt", exitedAt: new Date(now - 10 * 60 * 1000).toISOString() }, // 10 min
   };
   const changed = pruneExited(exited, now, PANIC_WATCH_MS);
   assert.ok(changed);
   assert.ok(exited.frisch && !exited.alt, "nur der alte Eintrag wird entfernt");
 });
 
-test("KRITISCH: alter verkaufter Token (> 30 min) wird nicht mehr beobachtet -> kein Fehl-Notaus", () => {
+test("KRITISCH: alter verkaufter Token (> 5 min) wird nicht mehr beobachtet -> kein Fehl-Notaus", () => {
   const now = 1_000_000_000_000;
-  const exited = { alt: { name: "alt-rug", exitedAt: new Date(now - 2 * 60 * 60 * 1000).toISOString() } }; // 2h
+  const exited = { alt: { name: "alt-rug", exitedAt: new Date(now - 30 * 60 * 1000).toISOString() } }; // 30 min
   pruneExited(exited, now, PANIC_WATCH_MS);
   assert.equal(Object.keys(exited).length, 0);
 });

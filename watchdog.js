@@ -8,18 +8,19 @@
 //                   erst vom Wächter verkaufter Token um <= -50 % in 5m ODER 1h ein
 //                   -> ALLE gehaltenen Positionen sofort verkaufen (korrelierter Meta-Rug).
 //
-// NACHBEOBACHTUNG (schließt die Lücke "erst -10%-Stop, 5 min später Total-Rug"):
+// NACHBEOBACHTUNG (schließt die Lücke "erst -10%-Stop, kurz danach Total-Rug"):
 //   Verkauft der Wächter eine Position (Stop/Trailing), merkt er sich den Mint in
-//   state.exited und beobachtet ihn PANIC_WATCH_MS (30 min) WEITER. Ruggt der Token
+//   state.exited und beobachtet ihn PANIC_WATCH_MS (5 min) WEITER. Ruggt der Token
 //   danach komplett (<= -50 %), löst er den Notaus für die übrigen Positionen aus —
 //   obwohl er schon aus dem Wallet geflogen ist. Nach einem Notaus wird state.exited
 //   geleert (einmaliger Trigger, keine Dauerauslösung).
 //
 // WICHTIG — was den Notaus NICHT auslöst:
 //   Nur (a) aktuell GEHALTENE Positionen (per RPC) und (b) vom WÄCHTER SELBST in den
-//   letzten 30 min verkaufte Token. Vom Bot regulär (6h-Frist) verkaufte Token und alte/
-//   zufällige Token werden NIE nachbeobachtet -> "irgendein alter Token" leert das Wallet
-//   nicht. Staub-Reste (< MIN_VALUE_USD) sind vom gehaltenen Trigger ausgenommen.
+//   letzten 5 min verkaufte Token. Vom Bot regulär (6h-Frist) verkaufte Token und alte/
+//   zufällige Token werden NIE nachbeobachtet. Das 5-min-Fenster ist zudem lange abgelaufen,
+//   bevor der Bot (kauft nur alle 2h) neue Positionen hält -> FRISCHE KÄUFE werden nie
+//   mit-einkassiert. Staub-Reste (< MIN_VALUE_USD) sind vom gehaltenen Trigger ausgenommen.
 //
 // State (positions.json, vom Workflow committet): { positions: {Trailing-Hoch je gehaltene
 // Position}, exited: {Mint -> {name, exitedAt} der zuletzt verkauften} }.
@@ -41,9 +42,10 @@ const TRAIL_DD_PCT = 15; // Einzel-Verkauf: >= 15 % unter dem Hoch seit Erstsich
 const PANIC_PCT = -50; // NOTAUS: Position <= -50 % in 5m ODER 1h -> ALLES verkaufen
 // Ein Token, das der WÄCHTER selbst gerade (unter Stress) verkauft hat, wird noch so lange
 // weiter beobachtet: ruggt es DANACH komplett (<= PANIC_PCT), löst es den Notaus für die
-// übrigen Positionen aus — auch wenn es schon aus dem Wallet geflogen ist. Kurz gehalten,
-// damit KEIN alter/zufälliger Token das Wallet leert; deckt "5 min später komplett geruggt" ab.
-const PANIC_WATCH_MS = 30 * 60 * 1000; // 30 min
+// übrigen Positionen aus — auch wenn es schon aus dem Wallet geflogen ist. Bewusst KURZ (5 min):
+// deckt "kurz nach dem Stop komplett geruggt" ab, ist aber lange abgelaufen, bevor der Bot
+// (kauft nur alle 2h) frische Positionen hält -> frische Käufe werden NIE mit-einkassiert.
+const PANIC_WATCH_MS = 5 * 60 * 1000; // 5 min
 // Der "Zu-heiß"-Take-Profit wurde ENTFERNT: das Nicht-zu-hoch-Kaufen ist beim Kauf
 // gelöst (Runup-Gate ab erster Kerze im Bot), ein Verkaufs-Deckel würde nur die
 // seltenen Mega-Runner abschneiden (Fat-Tail-Killer).
