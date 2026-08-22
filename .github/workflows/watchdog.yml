@@ -1,4 +1,5 @@
-# Wächter v2: Stop-Loss (-10 %/1h) + Trailing-Stop (-15 % vom Hoch).
+# Wächter v3: Einzel-Stop (-10 % 5m/1h) + Trailing-Stop (-15 % vom Hoch) +
+# Portfolio-Notaus (-50 % 5m/1h bei einer gehaltenen nicht-Staub-Position -> ALLES).
 # Läuft alle 10 Minuten (bzw. per externem Trigger alle 5). In einem ÖFFENTLICHEN Repo sind
 # Actions-Minuten unbegrenzt kostenlos. GitHub-Cron hat Jitter (0-15 min) —
 # für Pünktlichkeit zusätzlich per externem Cron workflow_dispatch triggern:

@@ -1,8 +1,20 @@
 #!/usr/bin/env node
-// Wächter v2: Stop-Loss + TRAILING-STOP.
-//   - Stop-Loss:    1h-Änderung <= -10 %  -> sofort verkaufen (Distribution/Rug)
+// Wächter v3: Stop-Loss + TRAILING-STOP (je Position) + PORTFOLIO-NOTAUS.
+//   - Stop-Loss:    5m- ODER 1h-Änderung <= -10 %  -> NUR diese Position verkaufen
+//                   (Distribution — nicht zwangsläufig ein Rug).
 //   - Trailing:     Kurs fällt >= 15 % unter das beobachtete Hoch seit Erstsichtung
-//                   -> verkaufen (Gewinne sichern, Spitzen nicht zurückgeben)
+//                   -> diese Position verkaufen (Gewinne sichern).
+//   - NOTAUS:       bricht IRGENDEINE gehaltene (nicht-Staub) Position um <= -50 % in
+//                   5m ODER 1h ein -> ALLE gehaltenen Positionen sofort verkaufen
+//                   (Signal für einen korrelierten Meta-Rug).
+//
+// WICHTIG — was den Notaus NICHT auslöst:
+//   Der Wächter betrachtet AUSSCHLIESSLICH aktuell gehaltene Positionen (per RPC aus
+//   dem Wallet). Bereits vom Bot verkaufte Token stehen nicht mehr im Wallet und können
+//   daher keinen Notaus auslösen — es wird nur verkauft, wenn ein Token IM Haltefenster
+//   ruggt. Staub-Reste bereits verkaufter Rug-Token (< MIN_VALUE_USD) sind vom
+//   Notaus-Trigger ausgenommen, damit nicht "irgendein alter Token" das ganze Wallet leert.
+//
 // Das Hoch je Position wird in positions.json geführt (vom Workflow committet).
 //
 // Aufruf: node watchdog.js [--check]   (--check: nur anzeigen, nicht verkaufen)
@@ -16,9 +28,10 @@ const { Keypair, Connection, VersionedTransaction } = require("@solana/web3.js")
 const { TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID } = require("@solana/spl-token");
 const bs58 = require("bs58");
 
-const STOP_M5_PCT = -10; // Verkauf: 5m-Änderung <= -10 % (schnellster Dump-Trigger)
-const STOP_H1_PCT = -10; // Verkauf: 1h-Änderung <= -10 %
-const TRAIL_DD_PCT = 15; // Verkauf: >= 15 % unter dem Hoch seit Erstsichtung
+const STOP_M5_PCT = -10; // Einzel-Verkauf: 5m-Änderung <= -10 % (schnellster Dump-Trigger)
+const STOP_H1_PCT = -10; // Einzel-Verkauf: 1h-Änderung <= -10 %
+const TRAIL_DD_PCT = 15; // Einzel-Verkauf: >= 15 % unter dem Hoch seit Erstsichtung
+const PANIC_PCT = -50; // NOTAUS: gehaltene (nicht-Staub) Position <= -50 % in 5m ODER 1h -> ALLES
 // Der "Zu-heiß"-Take-Profit wurde ENTFERNT: das Nicht-zu-hoch-Kaufen ist beim Kauf
 // gelöst (Runup-Gate ab erster Kerze im Bot), ein Verkaufs-Deckel würde nur die
 // seltenen Mega-Runner abschneiden (Fat-Tail-Killer).
@@ -37,7 +50,33 @@ function sellReason(m5, h1, ddFromHigh) {
   if (ddFromHigh <= -TRAIL_DD_PCT) return `TRAILING-STOP (${ddFromHigh.toFixed(1)}% vom Hoch)`;
   return null;
 }
-if (require.main !== module) module.exports = { sellReason, STOP_M5_PCT, STOP_H1_PCT, TRAIL_DD_PCT };
+
+/**
+ * PURE Notaus-Entscheidung für EINE Position: bricht sie um <= PANIC_PCT in 5m ODER 1h
+ * ein? Gibt den Grund-String oder null.
+ */
+function panicReason(m5, h1) {
+  if (m5 != null && m5 <= PANIC_PCT) return `NOTAUS (5m ${m5.toFixed(1)}%)`;
+  if (h1 != null && h1 <= PANIC_PCT) return `NOTAUS (1h ${h1.toFixed(1)}%)`;
+  return null;
+}
+
+/**
+ * PURE Portfolio-Notaus-Auswahl. `records` = angereicherte gehaltene Positionen
+ * ({ name, m5, h1, dust, fetchOk }). Liefert den ersten Auslöser oder null.
+ * WICHTIG: Staub (dust) und Positionen ohne Kursdaten (fetchOk=false) lösen NICHTS aus —
+ * so leert kein alter Rug-Staubrest versehentlich das ganze Wallet.
+ */
+function findPanic(records) {
+  for (const r of records) {
+    if (r.dust || !r.fetchOk) continue;
+    const reason = panicReason(r.m5, r.h1);
+    if (reason) return { rec: r, reason };
+  }
+  return null;
+}
+if (require.main !== module)
+  module.exports = { sellReason, panicReason, findPanic, STOP_M5_PCT, STOP_H1_PCT, TRAIL_DD_PCT, PANIC_PCT };
 const RPC_URL = process.env.RPC_URL || "https://api.mainnet-beta.solana.com";
 const POSITIONS_FILE = path.join(__dirname, "positions.json");
 
@@ -137,13 +176,16 @@ async function checkHeld(keypair, held, positions, checkOnly, quiet) {
     return stateChanged;
   }
 
-  // rückwärts iterieren, damit splice bei Verkauf sicher ist
-  for (let hi = held.length - 1; hi >= 0; hi--) {
-    const acc = held[hi];
+  // PASS 1: Für jede gehaltene Position Kursdaten holen und (bei nicht-Staub) das
+  // Trailing-Hoch pflegen. Ergebnis ist eine angereicherte Liste, auf der DANACH
+  // erst der Portfolio-Notaus und dann die Einzel-Stops entscheiden.
+  const enriched = [];
+  for (const acc of held) {
     let h1 = null,
       m5 = null,
       priceUsd = 0,
-      name = acc.mint;
+      name = acc.mint,
+      fetchOk = false;
     try {
       const list = await fetchJson(`${JUPITER}/tokens/v2/search?query=${acc.mint}`);
       const t = Array.isArray(list) ? list.find((x) => x.id === acc.mint) : null;
@@ -153,56 +195,92 @@ async function checkHeld(keypair, held, positions, checkOnly, quiet) {
         h1 = t.stats1h && typeof t.stats1h.priceChange === "number" ? t.stats1h.priceChange : null;
         m5 = t.stats5m && typeof t.stats5m.priceChange === "number" ? t.stats5m.priceChange : null;
       }
+      fetchOk = true;
     } catch (err) {
       if (!quiet) console.log(`${acc.mint}: Datenabruf fehlgeschlagen (${err.message}) — übersprungen`);
-      continue;
     }
 
     const valueUsd = (acc.uiAmount || 0) * priceUsd;
-    if (valueUsd < MIN_VALUE_USD) {
-      if (!quiet) console.log(`${new Date().toISOString()} ${name} | ~$${valueUsd.toFixed(2)} — Staub, ignoriert`);
-      continue;
+    const dust = valueUsd < MIN_VALUE_USD;
+    let ddFromHigh = 0;
+
+    // Trailing-Hoch nur für echte (nicht-Staub, mit Kursdaten) Positionen führen.
+    if (fetchOk && !dust) {
+      if (!positions[acc.mint]) {
+        positions[acc.mint] = { name, firstSeen: new Date().toISOString(), high: priceUsd };
+        stateChanged = true;
+      }
+      const pos = positions[acc.mint];
+      if (priceUsd > (pos.high || 0)) {
+        // nur in 2%-Schritten persistieren, damit nicht jeder Tick einen Commit erzeugt
+        if (priceUsd >= (pos.high || 0) * HIGH_PERSIST_STEP) stateChanged = true;
+        pos.high = Math.max(pos.high || 0, priceUsd);
+      }
+      ddFromHigh = pos.high > 0 ? (priceUsd / pos.high - 1) * 100 : 0;
     }
 
-    // Trailing-Hoch führen (Erstsichtung = Basis)
-    if (!positions[acc.mint]) {
-      positions[acc.mint] = { name, firstSeen: new Date().toISOString(), high: priceUsd };
-      stateChanged = true;
-    }
-    const pos = positions[acc.mint];
-    if (priceUsd > (pos.high || 0)) {
-      // nur in 2%-Schritten persistieren, damit nicht jeder Tick einen Commit erzeugt
-      if (priceUsd >= (pos.high || 0) * HIGH_PERSIST_STEP) stateChanged = true;
-      pos.high = Math.max(pos.high || 0, priceUsd);
-    }
-    const ddFromHigh = pos.high > 0 ? (priceUsd / pos.high - 1) * 100 : 0;
+    enriched.push({ acc, name, m5, h1, priceUsd, valueUsd, dust, fetchOk, ddFromHigh });
+  }
 
-    const tag =
-      `5m: ${m5 == null ? "n/a" : m5.toFixed(1) + "%"} | ` +
-      `1h: ${h1 == null ? "n/a" : h1.toFixed(1) + "%"} | ` +
-      `vom Hoch: ${ddFromHigh.toFixed(1)}% | ~$${valueUsd.toFixed(2)}`;
+  const fmtTag = (r) =>
+    `5m: ${r.m5 == null ? "n/a" : r.m5.toFixed(1) + "%"} | ` +
+    `1h: ${r.h1 == null ? "n/a" : r.h1.toFixed(1) + "%"} | ` +
+    `vom Hoch: ${r.ddFromHigh.toFixed(1)}% | ~$${r.valueUsd.toFixed(2)}`;
 
-    const reason = sellReason(m5, h1, ddFromHigh);
-
-    if (!reason) {
-      if (!quiet) console.log(`${new Date().toISOString()} ${name} | ${tag} — hält`);
-      continue;
-    }
-    // Verkaufsgrund wird IMMER geloggt (auch im quiet-Modus)
-    console.log(
-      `${new Date().toISOString()} ${name} | ${tag} — ${reason}${checkOnly ? " (nur Check)" : ", verkaufe"}`
-    );
-    if (checkOnly) continue;
+  // Verkauft eine Position; pflegt positions/held/stateChanged. Gibt true bei Erfolg.
+  const doSell = async (acc, label) => {
+    console.log(`${new Date().toISOString()} ${label}${checkOnly ? " (nur Check)" : ", verkaufe"}`);
+    if (checkOnly) return false;
     try {
       const sig = await sellAll(keypair, acc.mint, acc.rawAmount);
       console.log(`  -> verkauft (${sig})`);
       delete positions[acc.mint];
-      held.splice(hi, 1); // nicht erneut prüfen/verkaufen
+      const idx = held.indexOf(acc);
+      if (idx >= 0) held.splice(idx, 1);
       stateChanged = true;
+      await new Promise((r) => setTimeout(r, 500));
+      return true;
     } catch (err) {
       console.log(`  -> Verkauf fehlgeschlagen: ${err.message}`);
+      await new Promise((r) => setTimeout(r, 500));
+      return false;
     }
-    await new Promise((r) => setTimeout(r, 500));
+  };
+
+  // NOTAUS (Priorität 1): bricht IRGENDEINE gehaltene, nicht-Staub-Position um <= -50 %
+  // in 5m ODER 1h ein -> ALLE (nicht-Staub-)Positionen sofort verkaufen. Staub und
+  // Positionen ohne Kursdaten lösen NICHTS aus (findPanic filtert das).
+  const panic = findPanic(enriched);
+  if (panic) {
+    console.log(
+      `${new Date().toISOString()} !!! NOTAUS !!! Auslöser: ${panic.rec.name} | ${fmtTag(panic.rec)} ` +
+        `— ${panic.reason} -> ALLE Positionen verkaufen`
+    );
+    // Über eine Kopie iterieren, weil doSell aus `held` splict.
+    for (const r of enriched.slice()) {
+      if (r.dust) {
+        if (!quiet) console.log(`${new Date().toISOString()} ${r.name} | ~$${r.valueUsd.toFixed(2)} — Staub, übersprungen`);
+        continue;
+      }
+      await doSell(r.acc, `NOTAUS-Verkauf ${r.name} | ${fmtTag(r)}`);
+    }
+    return stateChanged;
+  }
+
+  // EINZEL-STOPS (Priorität 2): je Position 5m/1h/Trailing prüfen.
+  for (const r of enriched) {
+    if (!r.fetchOk) continue; // Fehler schon in Pass 1 geloggt
+    if (r.dust) {
+      if (!quiet) console.log(`${new Date().toISOString()} ${r.name} | ~$${r.valueUsd.toFixed(2)} — Staub, ignoriert`);
+      continue;
+    }
+    const reason = sellReason(r.m5, r.h1, r.ddFromHigh);
+    if (!reason) {
+      if (!quiet) console.log(`${new Date().toISOString()} ${r.name} | ${fmtTag(r)} — hält`);
+      continue;
+    }
+    // Verkaufsgrund wird IMMER geloggt (auch im quiet-Modus)
+    await doSell(r.acc, `${r.name} | ${fmtTag(r)} — ${reason}`);
   }
 
   return stateChanged;
